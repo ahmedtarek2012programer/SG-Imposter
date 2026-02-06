@@ -246,3 +246,13 @@ process.on('uncaughtException', error => {
 });
 
 client.login(process.env.DISCORD_TOKEN);
+const http = require("http");
+
+const PORT = process.env.PORT || 8000;
+
+http.createServer((req, res) => {
+  res.writeHead(200);
+  res.end("Bot is alive");
+}).listen(PORT, () => {
+  console.log(`Health server running on port ${PORT}`);
+});
