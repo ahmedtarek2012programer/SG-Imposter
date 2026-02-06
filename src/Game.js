@@ -2,6 +2,7 @@ const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentTyp
 const { STATE, STRINGS, ROUND_DURATION, VOTE_TIMEOUT, GAME_STATES, MIN_PLAYERS, MAX_PLAYERS } = require('./Constants');
 const Words = require('./Words');
 const Player = require('./Player');
+const PointsManager = require('./PointsManager');
 
 class Game {
     constructor(channel, host) {
@@ -116,15 +117,11 @@ class Game {
             
             // Function to run a step of the round
             const runStep = async () => {
-                if (this.state === GAME_STATES.ENDED) {
-                    resolve();
-                    return;
-                }
+                if (this.state === GAME_STATES.ENDED) return resolve();
 
                 if (available.length < 2) {
                     this.roundResolve = null;
-                    resolve(); // Round end
-                    return;
+                    return resolve(); 
                 }
 
                 // Pick 2 random players
@@ -136,30 +133,132 @@ class Game {
                 const answerer = available[answererIndex];
                 available.splice(answererIndex, 1);
 
-                // Send Message
-                await this.channel.send(STRINGS.QA_PAIR
-                    .replace('{asker}', asker.id)
-                    .replace('{answerer}', answerer.id));
+                // Check if they are still in game (might be kicked)
+                if (!this.players.has(asker.id) || !this.players.has(answerer.id)) {
+                    return runStep(); // Skip if anyone left
+                }
 
-                // Wait 40s
-                this.currentTimer = setTimeout(() => {
-                    if (this.state === GAME_STATES.ENDED) {
-                        resolve();
-                        return;
-                    }
+                try {
+                    // Step 1: Ask
+                    await this.channel.send(STRINGS.ASK_PROMPT
+                        .replace('{asker}', asker.id)
+                        .replace('{answerer}', answerer.id)
+                        .replace('{asker}', asker.id) // Replace second occurrence
+                        .replace('{answerer}', answerer.id) // Replace second occurrence
+                        .replace('{answerer}', answerer.id)); // Replace third occurrence if needed (safe to chain)
+                    
+                    const question = await this.waitForMessage(asker.id);
+
+                    // Step 2: Answer
+                    const questionEmbed = new EmbedBuilder()
+                        .setAuthor({ name: `سؤال من ${asker.displayName}`, iconURL: asker.user.displayAvatarURL() })
+                        .setDescription(`**${question}**`)
+                        .setColor('#3498DB');
+
+                    await this.channel.send({ 
+                        content: STRINGS.ANSWER_PROMPT.replace('{answerer}', answerer.id),
+                        embeds: [questionEmbed]
+                    });
+                        
+                    await this.waitForMessage(answerer.id);
+
+                    // Continue Loop
                     runStep();
-                }, ROUND_DURATION);
+
+                } catch (error) {
+                    if (error === 'TIMEOUT') {
+                        // Kick the player who timed out
+                        // Logic is tricky: capture who timed out?
+                        // waitForMessage throws 'TIMEOUT' so we need to know who we were waiting for.
+                        // Actually better to handle kick inside waitForMessage or pass ID?
+                        // Let's refactor waitForMessage to handle the kick, or catch specific error.
+                        // Simpler: catch block doesn't know WHO.
+                        // We will modify waitForMessage to return true/false, or handle kick internally?
+                        // Let's assume waitForMessage handles the kick message but we need to remove from available?
+                        // If player kicked -> Game State Check -> if game over resolve() else runStep().
+                        if (this.state === GAME_STATES.ENDED) return resolve();
+                        runStep();
+                    } else if (error === 'GAME_ENDED') {
+                         resolve();
+                    }
+                }
             };
 
             runStep();
         });
     }
 
+    async waitForMessage(userId) {
+        return new Promise((resolve, reject) => {
+            const filter = m => m.author.id === userId && !m.author.bot;
+            const collector = this.channel.createMessageCollector({ 
+                filter, 
+                time: require('./Constants').INTERACTION_TIMEOUT, 
+                max: 1 
+            });
+            
+            // Allow stopping externally
+            this.messageCollector = collector;
+
+            collector.on('collect', (m) => {
+                resolve(m.content);
+            });
+
+            collector.on('end', (collected, reason) => {
+                if (reason === 'time') {
+                    if (this.state === GAME_STATES.ENDED) return reject('GAME_ENDED');
+                    this.kickPlayer(userId);
+                    reject('TIMEOUT');
+                } else if (reason === 'game_stopped') {
+                    reject('GAME_ENDED');
+                }
+            });
+        });
+    }
+
+    async kickPlayer(userId) {
+        const player = this.players.get(userId);
+        if (!player) return;
+
+        this.players.delete(userId);
+        
+        // Announce Kick
+        const role = player.isImposter ? STRINGS.SYSTEM_IMPOSTER : STRINGS.SYSTEM_CREW;
+        await this.channel.send(STRINGS.TIMEOUT_KICK.replace('{player}', userId) + '\n' + STRINGS.PLAYER_ROLE_REVEAL.replace('{role}', role));
+
+        // Check Win Condition
+        if (player.isImposter) {
+            // Check if any imposters left
+            const remainingImposters = this.imposters.filter(p => this.players.has(p.id));
+            if (remainingImposters.length === 0) {
+                this.channel.send(STRINGS.CREW_WIN);
+                this.awardPoints('CREW');
+                this.startImposterGuessing(); // Was this.stop()
+            }
+        } else {
+            // Crew kicked. Check if Imposters >= Crew
+            const impostersLeft = this.imposters.filter(p => this.players.has(p.id)).length;
+            const crewLeft = this.players.size - impostersLeft;
+
+            if (impostersLeft >= crewLeft) {
+                this.channel.send(STRINGS.IMPOSTER_WIN);
+                this.awardPoints('IMPOSTER');
+                this.startImposterGuessing(); // Was this.stop()
+            } else if (this.players.size < 2) {
+                 // Should not happen if imposter logic is correct, but safety
+                 this.channel.send(STRINGS.IMPOSTER_WIN); 
+                 this.awardPoints('IMPOSTER');
+                 this.startImposterGuessing();
+            }
+        }
+    }
+
     stop() {
         this.state = GAME_STATES.ENDED;
         if (this.currentTimer) clearTimeout(this.currentTimer);
-        if (this.roundResolve) this.roundResolve();
+        if (this.messageCollector) this.messageCollector.stop('game_stopped');
         if (this.voteCollector) this.voteCollector.stop();
+        if (this.roundResolve) this.roundResolve();
         if (this.onEnd) this.onEnd();
     }
 
@@ -202,6 +301,10 @@ class Game {
         this.voteCollector = collector;
 
         collector.on('collect', async i => {
+            if (!this.players.has(i.user.id)) {
+                return i.reply({ content: 'أنت لست مشاركاً في اللعبة ولا يمكنك التصويت!', ephemeral: true });
+            }
+
             if (voters.has(i.user.id)) {
                 return i.reply({ content: 'لقد صوت بالفعل!', ephemeral: true });
             }
@@ -233,28 +336,94 @@ class Game {
             }
         });
 
-        // Simple win logic for 1 imposter (expandable for multiple)
-        // If multiple imposters, logic is more complex as per prompt
-        
         if (!votedOutId) {
-             this.channel.send(STRINGS.IMPOSTER_WIN); // No one voted out? Imposter wins? Or just skip?
-             // Prompt says "If they fail to reveal him -> Imposter wins"
+             // Imposter Wins (No one voted out)
+             this.channel.send(STRINGS.IMPOSTER_WIN);
+             this.awardPoints('IMPOSTER');
+             this.startImposterGuessing(); // Go to guess phase
              return;
         }
 
         const votedPlayer = this.players.get(votedOutId);
         if (votedPlayer.isImposter) {
-             // Check if all imposters caught?
-             // For simplicity, let's assume if the voted person is imposter, Crew wins (for 1 imposter scenario)
+             // Crew Wins
              this.channel.send(STRINGS.CREW_WIN + `\nالـ Imposter كان <@${votedPlayer.id}>`);
+             this.awardPoints('CREW');
         } else {
              this.channel.send(STRINGS.IMPOSTER_WIN + `\nالضحية البريئة كانت <@${votedPlayer.id}>`);
              // Reveal actual imposters
              const imposterNames = this.imposters.map(p => `<@${p.id}>`).join(', ');
              this.channel.send(`الـ Imposters الحقيقيون هم: ${imposterNames}`);
+             this.awardPoints('IMPOSTER');
         }
         
-        if (this.onEnd) this.onEnd();
+        if (this.onEnd) this.onEnd(); // Previously here, now removing for Guess Phase
+        this.startImposterGuessing();
+    }
+
+    async startImposterGuessing() {
+        // Only if there are active imposters?
+        const activeImposters = this.imposters.filter(p => this.players.has(p.id));
+        if (activeImposters.length === 0) {
+            this.stop();
+            return;
+        }
+
+        const distractors = Words.getDistractors(this.secretWord, 3);
+        const options = [this.secretWord, ...distractors];
+        // Shuffle options
+        for (let i = options.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [options[i], options[j]] = [options[j], options[i]];
+        }
+
+        const row = new ActionRowBuilder();
+        options.forEach((opt, index) => {
+            row.addComponents(
+                new ButtonBuilder()
+                    .setCustomId(`guess_${index}_${opt}`)
+                    .setLabel(opt)
+                    .setStyle(ButtonStyle.Primary)
+            );
+        });
+
+        const embed = new EmbedBuilder()
+            .setTitle(STRINGS.GUESS_PHASE_TITLE)
+            .setDescription(STRINGS.GUESS_PROMPT)
+            .setColor('#9B59B6');
+
+        const msg = await this.channel.send({ embeds: [embed], components: [row] });
+
+        try {
+            const filter = i => i.customId.startsWith('guess_') && this.imposters.some(imp => imp.id === i.user.id);
+            const confirmation = await msg.awaitMessageComponent({ filter, time: 20000, componentType: ComponentType.Button });
+
+            const chosenWord = confirmation.customId.split('_')[2];
+            
+            if (chosenWord === this.secretWord) {
+                await confirmation.update({ content: STRINGS.GUESS_CORRECT, embeds: [], components: [] });
+                // Award 3 points to ALL imposters (even kicked ones? "add to EACH imposter". Usually implies participating ones, but maybe all for team win?)
+                // Let's award to all imposters in this.imposters list (recorded at start)
+                this.imposters.forEach(imp => PointsManager.addPoints(imp.id, 3));
+            } else {
+                await confirmation.update({ content: STRINGS.GUESS_WRONG.replace('{word}', this.secretWord), embeds: [], components: [] });
+            }
+        } catch (e) {
+            // Timeout or error
+            await msg.edit({ content: `⏰ ${STRINGS.GUESS_WRONG.replace('{word}', this.secretWord)}`, embeds: [], components: [] });
+        }
+
+        this.stop();
+    }
+
+    awardPoints(winningTeam) {
+        this.players.forEach(player => {
+            if (winningTeam === 'CREW') {
+                if (!player.isImposter) PointsManager.addPoints(player.id, 5);
+            } else if (winningTeam === 'IMPOSTER') {
+                if (player.isImposter) PointsManager.addPoints(player.id, 10);
+            }
+        });
     }
 }
 

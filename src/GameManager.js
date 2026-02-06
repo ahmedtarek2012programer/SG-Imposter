@@ -19,6 +19,10 @@ class GameManager {
         return this.games.get(channelId);
     }
 
+    hasGame(channelId) {
+        return this.games.has(channelId);
+    }
+
     endGame(channelId) {
         this.games.delete(channelId);
     }

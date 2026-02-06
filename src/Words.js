@@ -18,5 +18,15 @@ const words = [
 module.exports = {
     getRandomWord: () => {
         return words[Math.floor(Math.random() * words.length)];
+    },
+    
+    getDistractors: (correctWord, count = 3) => {
+        const filtered = words.filter(w => w !== correctWord);
+        // Shuffle filtered
+        for (let i = filtered.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [filtered[i], filtered[j]] = [filtered[j], filtered[i]];
+        }
+        return filtered.slice(0, count);
     }
 };
