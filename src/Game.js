@@ -88,11 +88,15 @@ class Game {
             [playerIds[i], playerIds[j]] = [playerIds[j], playerIds[i]];
         }
 
+        console.log(`[Game] Players: ${count}, Imposter Count: ${imposterCount}`);
+
         for (let i = 0; i < imposterCount; i++) {
             const player = this.players.get(playerIds[i]);
             player.isImposter = true;
             this.imposters.push(player);
+            console.log(`[Game] Assigned Imposter: ${player.displayName} (${player.id})`);
         }
+        console.log(`[Game] Total Imposters: ${this.imposters.length}`);
     }
 
     async startRounds() {
@@ -102,7 +106,79 @@ class Game {
             await this.playRound();
             if (this.state === GAME_STATES.ENDED) return; // Stop if game ended externally
         }
+
+        const wantExtra = await this.askForExtraRound();
+        if (this.state === GAME_STATES.ENDED) return;
+
+        if (wantExtra) {
+            this.roundCount = 4;
+            await this.channel.send(STRINGS.ROUND_START.replace('{round}', 4));
+            await this.playRound();
+            if (this.state === GAME_STATES.ENDED) return;
+        }
+
         this.startVoting();
+    }
+
+    async askForExtraRound() {
+        return new Promise(async (resolve) => {
+            const embed = new EmbedBuilder()
+                .setTitle('🤔 قرار جماعي')
+                .setDescription(STRINGS.EXTRA_ROUND_PROMPT)
+                .setColor('#E67E22');
+
+            let extraCount = 0;
+            let voteNowCount = 0;
+            const voters = new Set();
+
+            const getComponents = () => {
+                const row = new ActionRowBuilder()
+                    .addComponents(
+                        new ButtonBuilder()
+                            .setCustomId('extra_round_yes')
+                            .setLabel(`${STRINGS.BTN_EXTRA_ROUND} (${extraCount})`)
+                            .setStyle(ButtonStyle.Primary),
+                        new ButtonBuilder()
+                            .setCustomId('extra_round_no')
+                            .setLabel(`${STRINGS.BTN_VOTE_NOW} (${voteNowCount})`)
+                            .setStyle(ButtonStyle.Danger)
+                    );
+                return [row];
+            };
+
+            const msg = await this.channel.send({ embeds: [embed], components: getComponents() });
+
+            const collector = msg.createMessageComponentCollector({ 
+                componentType: ComponentType.Button, 
+                time: 20000 
+            });
+
+            collector.on('collect', async i => {
+                if (!this.players.has(i.user.id)) {
+                    return i.reply({ content: 'أنت لست مشاركاً في اللعبة!', ephemeral: true });
+                }
+
+                if (voters.has(i.user.id)) {
+                    return i.reply({ content: 'لقد قمت بالتصويت مسبقاً!', ephemeral: true });
+                }
+
+                voters.add(i.user.id);
+                if (i.customId === 'extra_round_yes') extraCount++;
+                else voteNowCount++;
+
+                await i.update({ components: getComponents() });
+            });
+
+            collector.on('end', () => {
+                if (extraCount > voteNowCount) {
+                    this.channel.send('✅ الأغلبية اختارت: **جولة أخيرة!**');
+                    resolve(true);
+                } else {
+                    this.channel.send('🗳️ الأغلبية اختارت: **التصويت الآن!**');
+                    resolve(false);
+                }
+            });
+        });
     }
 
     async playRound() {
